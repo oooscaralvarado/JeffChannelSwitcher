@@ -1,0 +1,232 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Channel Surfer</title>
+<link href="https://fonts.googleapis.com/css2?family=VT323&display=swap" rel="stylesheet">
+<style>
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+  #player, #player iframe { position: absolute; inset: 0; width: 100%; height: 100%; border: 0; }
+  #static { position: absolute; inset: 0; width: 100%; height: 100%; opacity: 0; pointer-events: none; image-rendering: pixelated; }
+  #scan { position: absolute; inset: 0; pointer-events: none; display: none;
+          background: repeating-linear-gradient(0deg, rgba(0,0,0,.18) 0 2px, transparent 2px 4px); }
+  #title { position: absolute; left: 4%; bottom: 7%; max-width: 70%; opacity: 0; transition: opacity .4s;
+           font-family: 'VT323', 'Courier New', monospace; color: #46ff5a;
+           text-shadow: 0 0 10px #46ff5a, 3px 3px 0 #000; }
+  #title small { display: block; font-size: 3.6vh; color: #b8ffc0; }
+  #title span { display: block; font-size: 6.5vh; line-height: 1; }
+  #msg { position: absolute; left: 0; right: 0; top: 8%; text-align: center; color: #fff;
+         font: 5vh 'VT323', 'Courier New', monospace; text-shadow: 2px 2px 0 #000; }
+  .on { opacity: 1 !important; }
+</style>
+</head>
+<body>
+<div id="player"></div>
+<canvas id="static" width="192" height="108"></canvas>
+<div id="scan"></div>
+<div id="title"><small>Now playing</small><span></span></div>
+<div id="msg"></div>
+
+<script>
+/* ---------- Settings (all via URL parameters) ----------
+  channel=UCxxxx     YouTube channel ID: shuffles every long-form upload (no Shorts)
+  list=PLxxxx        or a playlist ID
+  videos=id1,id2     and/or individual video IDs
+  title=always       keep the episode title on screen (default: shows for 10s)
+  title=off          never show the title
+  randomstart=0      start the first video from the beginning instead of mid-episode
+  static=600         static burst between episodes in ms (0 = none)
+  staticsound=0      turn off the static hiss
+  volume=100         video volume 0-100
+  scanlines=1        add CRT scanlines
+--------------------------------------------------------- */
+const q = new URLSearchParams(location.search);
+const CHANNEL = q.get('channel');
+const LIST = q.get('list');
+const EXTRA = (q.get('videos') || '').split(',').map(s => s.trim()).filter(Boolean);
+const TITLE_MODE = q.get('title') || 'auto';
+const RANDOM_START = q.get('randomstart') !== '0';
+const STATIC_MS = parseInt(q.get('static') ?? '600', 10);
+const STATIC_SOUND = q.get('staticsound') !== '0';
+const VOLUME = Math.min(100, Math.max(0, parseInt(q.get('volume') || '100', 10)));
+const IN_OBS = !!window.obsstudio;
+if (q.get('scanlines') === '1') document.getElementById('scan').style.display = 'block';
+
+// A channel ID (UC...) maps to its uploads playlists: UULF = long videos only, UU = everything
+const listsToTry = [];
+if (CHANNEL && CHANNEL.startsWith('UC')) listsToTry.push('UULF' + CHANNEL.slice(2), 'UU' + CHANNEL.slice(2));
+if (LIST) listsToTry.push(LIST);
+
+const $static = document.getElementById('static');
+const $title = document.getElementById('title');
+const $titleText = $title.querySelector('span');
+const $msg = document.getElementById('msg');
+
+let player, ids = [], bag = [], lastId = null;
+let failsafe = null, titleTimer = null;
+let loading = false, firstVideo = true, seekPending = false, errorsInRow = 0;
+
+/* ---------- TV static ---------- */
+const ctx = $static.getContext('2d');
+const img = ctx.createImageData($static.width, $static.height);
+let staticOn = false, audioCtx = null, hiss = null;
+function drawNoise() {
+  if (!staticOn) return;
+  const d = img.data;
+  for (let i = 0; i < d.length; i += 4) { const v = Math.random() * 255 | 0; d[i] = d[i+1] = d[i+2] = v; d[i+3] = 255; }
+  ctx.putImageData(img, 0, 0);
+  requestAnimationFrame(drawNoise);
+}
+function startHiss() {
+  if (!STATIC_SOUND) return;
+  try {
+    audioCtx = audioCtx || new (window.AudioContext || window.webkitAudioContext)();
+    const buf = audioCtx.createBuffer(1, audioCtx.sampleRate * 2, audioCtx.sampleRate);
+    const ch = buf.getChannelData(0);
+    for (let i = 0; i < ch.length; i++) ch[i] = Math.random() * 2 - 1;
+    const src = audioCtx.createBufferSource(); src.buffer = buf; src.loop = true;
+    const filt = audioCtx.createBiquadFilter(); filt.type = 'bandpass'; filt.frequency.value = 3000;
+    const gain = audioCtx.createGain(); gain.gain.value = 0.1 * (VOLUME / 100);
+    src.connect(filt).connect(gain).connect(audioCtx.destination);
+    src.start(); hiss = src;
+  } catch (e) {}
+}
+function showStatic(on) {
+  if (on === staticOn) return;
+  staticOn = on;
+  $static.classList.toggle('on', on);
+  if (on) { drawNoise(); startHiss(); } else { try { hiss && hiss.stop(); } catch (e) {} hiss = null; }
+}
+
+/* ---------- Episode title ---------- */
+function showTitle() {
+  if (TITLE_MODE === 'off') return;
+  const t = player.getVideoData && player.getVideoData().title;
+  if (!t) return;
+  $titleText.textContent = t;
+  $title.classList.add('on');
+  clearTimeout(titleTimer);
+  if (TITLE_MODE !== 'always') titleTimer = setTimeout(() => $title.classList.remove('on'), 10000);
+}
+
+/* ---------- Shuffle playback ---------- */
+function shuffle(a) {
+  for (let i = a.length - 1; i > 0; i--) { const j = Math.random() * (i + 1) | 0; [a[i], a[j]] = [a[j], a[i]]; }
+  return a;
+}
+function nextId() {
+  if (!bag.length) {
+    bag = shuffle([...ids]);
+    if (bag.length > 1 && bag[bag.length - 1] === lastId) [bag[0], bag[bag.length - 1]] = [bag[bag.length - 1], bag[0]];
+  }
+  return bag.pop();
+}
+
+function playNext() {
+  if (!ids.length) return;
+  clearTimeout(failsafe);
+  if (STATIC_MS > 0 || firstVideo) showStatic(true);
+  $title.classList.remove('on');
+  const id = nextId(); lastId = id;
+  loading = true;
+  seekPending = firstVideo && RANDOM_START; // only the very first episode starts mid-way
+  firstVideo = false;
+  player.loadVideoById(id);
+  failsafe = setTimeout(() => { if (loading) playNext(); }, 15000);
+}
+
+function started() {
+  loading = false; errorsInRow = 0;
+  clearTimeout(failsafe);
+  setTimeout(() => showStatic(false), Math.max(STATIC_MS, 150));
+  showTitle();
+}
+
+function onState(e) {
+  const S = YT.PlayerState;
+  if (e.data === S.PLAYING && loading) {
+    if (seekPending) {
+      seekPending = false;
+      const dur = player.getDuration();
+      if (dur > 60) {
+        player.seekTo(dur * (0.05 + Math.random() * 0.7), true);
+        setTimeout(() => { if (loading && player.getPlayerState() === S.PLAYING) started(); }, 1500);
+        return;
+      }
+    }
+    started();
+  } else if (e.data === S.ENDED) {
+    playNext();
+  }
+}
+
+function onError() {
+  // Usually "embedding disabled" or a private/age-restricted video: skip it
+  errorsInRow++;
+  ids = ids.filter(x => x !== lastId);
+  bag = bag.filter(x => x !== lastId);
+  if (!ids.length || errorsInRow > 25) {
+    loading = false;
+    showStatic(true);
+    $msg.textContent = 'No signal. None of these videos allow embedding.';
+    return;
+  }
+  setTimeout(playNext, 300);
+}
+
+/* ---------- Setup ---------- */
+function start() {
+  ids = [...new Set(ids.concat(EXTRA))];
+  if (!ids.length) {
+    showStatic(true);
+    $msg.textContent = 'No videos found. Check the channel= or list= value in the URL.';
+    return;
+  }
+  if (!IN_OBS) {
+    player.mute();
+    $msg.textContent = 'Preview is muted. Click to unmute.';
+    document.addEventListener('click', () => { player.unMute(); $msg.textContent = ''; }, { once: true });
+  }
+  playNext();
+}
+
+function loadList(i) {
+  if (i >= listsToTry.length) return start();
+  player.cuePlaylist({ listType: 'playlist', list: listsToTry[i] });
+  let tries = 0;
+  const poll = setInterval(() => {
+    const pl = player.getPlaylist();
+    if (pl && pl.length) { clearInterval(poll); ids = ids.concat(pl); start(); }
+    else if (++tries > 24) { clearInterval(poll); loadList(i + 1); } // try the next option
+  }, 250);
+}
+
+function onReady() {
+  player.setVolume(VOLUME);
+  loadList(0);
+}
+
+window.onYouTubeIframeAPIReady = function () {
+  player = new YT.Player('player', {
+    width: '100%', height: '100%',
+    playerVars: { autoplay: 0, controls: 0, disablekb: 1, fs: 0, rel: 0, iv_load_policy: 3,
+                  modestbranding: 1, playsinline: 1, origin: location.origin },
+    events: { onReady, onStateChange: onState, onError }
+  });
+};
+
+// Keeps playing in the background; re-show the title whenever the scene goes live
+window.addEventListener('obsSourceActiveChanged', e => {
+  if (e.detail.active && player && !loading) showTitle();
+});
+
+// Press N while interacting with the source to skip to another episode
+document.addEventListener('keydown', e => { if (e.key.toLowerCase() === 'n') playNext(); });
+
+showStatic(true);
+const tag = document.createElement('script');
+tag.src = 'https://www.youtube.com/iframe_api';
+document.head.appendChild(tag);
+</script>
+</body>
+</html>
